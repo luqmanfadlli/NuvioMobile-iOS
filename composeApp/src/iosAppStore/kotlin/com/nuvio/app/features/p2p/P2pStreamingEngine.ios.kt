@@ -9,7 +9,7 @@ actual object P2pStreamingEngine {
     actual val state: StateFlow<P2pStreamingState> = _state.asStateFlow()
 
     actual suspend fun startStream(request: P2pStreamRequest): String {
-        val message = "P2P streaming is not available on this platform"
+        val message = "P2P streaming is not available in the iOS App Store distribution"
         _state.value = P2pStreamingState.Error(message)
         throw P2pStreamingException(message)
     }

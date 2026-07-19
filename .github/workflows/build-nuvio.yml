@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - 0.3.0-enhanced
+      - debugging
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -71,7 +71,6 @@ jobs:
               content = f.read()
 
           for name, (url, checksum) in replacements.items():
-              # Match binaryTarget with path: for this exact name
               pattern = (
                   r'(\.binaryTarget\(\s*\n\s*name:\s*"' + re.escape(name) + r'",\s*\n)'
                   r'\s*path:\s*"[^"]+"\s*\n'
@@ -110,6 +109,13 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.25.x'
+          cache: true
+          cache-dependency-path: go-torrent/go.mod
+
       - name: Generate local.properties
         run: |
           cat << 'EOF' > local.properties
@@ -121,6 +127,8 @@ jobs:
           PREMIUMIZE_CLIENT_ID=${{ secrets.PREMIUMIZE_CLIENT_ID }}
           PREMIUMIZE_CLIENT_SECRET=${{ secrets.PREMIUMIZE_CLIENT_SECRET }}
           PREMIUMIZE_REDIRECT_URI=${{ secrets.PREMIUMIZE_REDIRECT_URI }}
+          IMDB_RATINGS_API_BASE_URL=${{ secrets.IMDB_RATINGS_API_BASE_URL }}
+          IMDB_TAPFRAME_API_BASE_URL=${{ secrets.IMDB_TAPFRAME_API_BASE_URL }}
           TMDB_API_KEY=${{ secrets.TMDB_API_KEY }}
           INTRODB_API_URL=${{ secrets.INTRODB_API_URL }}
           CONTRIBUTIONS_URL=${{ secrets.CONTRIBUTIONS_URL }}
@@ -139,11 +147,63 @@ jobs:
             ~/.konan
             ~/Library/Caches/org.swift.swiftpm
             iosApp/build/SourcePackages
-          key: ${{ runner.os }}-ios-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties', 'MPVKit/Package.swift', 'iosApp/iosApp.xcodeproj/project.pbxproj') }}
+          key: ${{ runner.os }}-ios-deps-v2-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties', 'MPVKit/Package.swift') }}
           restore-keys: |
-            ${{ runner.os }}-ios-
+            ${{ runner.os }}-ios-deps-v2-
+
+      - name: Cache GoTorrent XCFramework
+        id: cache-gotorrent
+        uses: actions/cache@v5
+        with:
+          path: iosApp/Frameworks/GoTorrent.xcframework
+          key: ${{ runner.os }}-gotorrent-v2-${{ hashFiles('go-torrent/go.mod', 'go-torrent/go.sum', 'go-torrent/*.go', 'scripts/build-gotorrent-xcframework.sh') }}
+          restore-keys: |
+            ${{ runner.os }}-gotorrent-v2-
+
+      - name: Install gomobile and register gobind tool dependency
+        env:
+          GOTOOLCHAIN: auto
+          X_MOBILE_VERSION: v0.0.0-20260709172247-6129f5bee9d5
+        run: |
+          set -euo pipefail
+
+          GO_BIN_DIR="$(go env GOPATH)/bin"
+          echo "$GO_BIN_DIR" >> "$GITHUB_PATH"
+          export PATH="$GO_BIN_DIR:$PATH"
+          go install "golang.org/x/mobile/cmd/gomobile@${X_MOBILE_VERSION}"
+          pushd go-torrent >/dev/null
+          go get -tool "golang.org/x/mobile/cmd/gobind@${X_MOBILE_VERSION}"
+          go mod download
+          popd >/dev/null
+
+          gomobile version || true
+
+      - name: Build GoTorrent XCFramework
+        env:
+          GOTOOLCHAIN: auto
+        run: |
+          set -euo pipefail
+          chmod +x ./scripts/build-gotorrent-xcframework.sh
+          export PATH="$(go env GOPATH)/bin:$PATH"
+
+          FRAMEWORK_ROOT="iosApp/Frameworks/GoTorrent.xcframework"
+          DEVICE_FRAMEWORK="$FRAMEWORK_ROOT/ios-arm64/GoTorrent.framework/GoTorrent"
+
+          if [ -f "$DEVICE_FRAMEWORK" ]; then
+            echo "Using cached GoTorrent device framework: $DEVICE_FRAMEWORK"
+          else
+            rm -rf "$FRAMEWORK_ROOT"
+            ./scripts/build-gotorrent-xcframework.sh
+          fi
+
+          test -f "$DEVICE_FRAMEWORK"
+          echo "GoTorrent XCFramework contents:"
+          find "$FRAMEWORK_ROOT" -maxdepth 3 -type f -print
 
       - name: Build iOS App via Xcode
+        env:
+          NUVIO_SWIFT_FLAGS: "-D NUVIO_FULL -F${{ github.workspace }}/iosApp/Frameworks/GoTorrent.xcframework/ios-arm64"
+          NUVIO_P2P_LDFLAGS: "-F${{ github.workspace }}/iosApp/Frameworks/GoTorrent.xcframework/ios-arm64 -framework GoTorrent"
         run: |
           cd iosApp
           xcodebuild \
@@ -200,6 +260,8 @@ jobs:
           PREMIUMIZE_CLIENT_ID=${{ secrets.PREMIUMIZE_CLIENT_ID }}
           PREMIUMIZE_CLIENT_SECRET=${{ secrets.PREMIUMIZE_CLIENT_SECRET }}
           PREMIUMIZE_REDIRECT_URI=${{ secrets.PREMIUMIZE_REDIRECT_URI }}
+          IMDB_RATINGS_API_BASE_URL=${{ secrets.IMDB_RATINGS_API_BASE_URL }}
+          IMDB_TAPFRAME_API_BASE_URL=${{ secrets.IMDB_TAPFRAME_API_BASE_URL }}
           TMDB_API_KEY=${{ secrets.TMDB_API_KEY }}
           INTRODB_API_URL=${{ secrets.INTRODB_API_URL }}
           CONTRIBUTIONS_URL=${{ secrets.CONTRIBUTIONS_URL }}

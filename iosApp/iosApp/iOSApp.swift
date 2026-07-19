@@ -5,6 +5,10 @@ import ComposeApp
 struct iOSApp: App {
     @UIApplicationDelegateAdaptor(OrientationLockAppDelegate.self) private var appDelegate
 
+    init() {
+        NuvioNativeP2PRegistration.registerIfAvailable()
+    }
+
     var body: some Scene {
         WindowGroup {
             ContentView()

@@ -4,3 +4,10 @@ TEAM_ID=
 
 PRODUCT_NAME=Nuvio
 PRODUCT_BUNDLE_IDENTIFIER=com.nuvio.app.Nuvio$(TEAM_ID)
+
+// Native iOS P2P support. Defaults keep App Store builds safe.
+// For iosFull builds, provide: NUVIO_SWIFT_FLAGS=-D NUVIO_FULL and
+// NUVIO_P2P_LDFLAGS=-framework GoTorrent after building iosApp/Frameworks/GoTorrent.xcframework.
+FRAMEWORK_SEARCH_PATHS = $(inherited) $(PROJECT_DIR)/Frameworks
+OTHER_SWIFT_FLAGS = $(inherited) $(NUVIO_SWIFT_FLAGS)
+OTHER_LDFLAGS = $(inherited) $(NUVIO_P2P_LDFLAGS)
