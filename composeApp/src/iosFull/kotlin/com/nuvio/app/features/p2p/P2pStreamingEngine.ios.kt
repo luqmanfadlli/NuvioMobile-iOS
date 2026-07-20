@@ -26,6 +26,9 @@ actual object P2pStreamingEngine {
     private val _state = MutableStateFlow<P2pStreamingState>(P2pStreamingState.Idle)
     actual val state: StateFlow<P2pStreamingState> = _state.asStateFlow()
 
+    private val _cacheState = MutableStateFlow(P2pCacheUiState())
+    actual val cacheState: StateFlow<P2pCacheUiState> = _cacheState.asStateFlow()
+
     private val json = Json { ignoreUnknownKeys = true }
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val lifecycleLock = NSLock()
@@ -38,7 +41,7 @@ actual object P2pStreamingEngine {
     actual suspend fun startStream(request: P2pStreamRequest): String = withContext(Dispatchers.Default) {
         stopStreamNow(stopEngine = false)
         val generation = nextStreamGeneration()
-        _state.value = P2pStreamingState.Connecting
+        _state.value = P2pStreamingState.Connecting()
 
         try {
             val nativeBridge = ensureBridge()
@@ -78,9 +81,11 @@ actual object P2pStreamingEngine {
                 uploadSpeed = readyStatus.uploadRate,
                 peers = readyStatus.numPeers,
                 seeds = readyStatus.numSeeds,
-                bufferProgress = 0f,
-                totalProgress = readyStatus.progress.toFloat(),
-                preloadedBytes = readyStatus.preloadedBytes,
+                bufferProgress = ratio(readyStatus.preloadedBytes, readyStatus.totalSizeBytes),
+                totalProgress = readyStatus.progress.toFloat().coerceIn(0f, 1f),
+                downloadedBytes = readyStatus.downloadedBytes,
+                verifiedBytes = readyStatus.downloadedBytes,
+                deliveredBytes = 0L,
             )
 
             startStatsPolling(nativeBridge, sessionId, generation)
@@ -107,6 +112,18 @@ actual object P2pStreamingEngine {
         }
     }
 
+    actual suspend fun clearCache(): P2pCacheClearResult {
+        check(
+            _state.value !is P2pStreamingState.Connecting &&
+                _state.value !is P2pStreamingState.Streaming,
+        ) {
+            "Torrent cache cannot be cleared during active playback"
+        }
+        throw P2pStreamingException(
+            "Clearing the GoTorrent cache is not supported by the current iOS native bridge",
+        )
+    }
+
     private suspend fun waitForPlayableStatus(
         nativeBridge: IosP2pNativeBridge,
         sessionId: String,
@@ -128,7 +145,7 @@ actual object P2pStreamingEngine {
                     }
                 }
                 if (playableStatus == null) {
-                    _state.value = P2pStreamingState.Connecting
+                    _state.value = P2pStreamingState.Connecting()
                     delay(IOS_P2P_STATUS_POLL_MS)
                 }
             }
@@ -225,8 +242,10 @@ actual object P2pStreamingEngine {
                             uploadSpeed = status.uploadRate,
                             peers = status.numPeers,
                             seeds = status.numSeeds,
-                            totalProgress = status.progress.toFloat(),
-                            preloadedBytes = status.preloadedBytes,
+                            bufferProgress = ratio(status.preloadedBytes, status.totalSizeBytes),
+                            totalProgress = status.progress.toFloat().coerceIn(0f, 1f),
+                            downloadedBytes = status.downloadedBytes,
+                            verifiedBytes = status.downloadedBytes,
                         )
                     }
                 } catch (cancellation: CancellationException) {
@@ -274,6 +293,13 @@ actual object P2pStreamingEngine {
             NativeTorrentSessionStatus(errorMessage = "Failed to parse native torrent status")
         }
     }
+
+    private fun ratio(value: Long, total: Long): Float =
+        if (total <= 0L) {
+            0f
+        } else {
+            (value.toDouble() / total.toDouble()).toFloat().coerceIn(0f, 1f)
+        }
 
     private val DEFAULT_TRACKERS = listOf(
         "udp://tracker.opentrackr.org:1337/announce",
