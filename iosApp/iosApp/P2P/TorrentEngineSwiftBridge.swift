@@ -20,21 +20,27 @@ import GoTorrent
         super.init()
     }
 
+    private var cacheDirectoryPath: String {
+        FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("TorrentCache", isDirectory: true)
+            .path
+    }
+
     @objc public func startEngine(_ configJson: String) {
         engineQueue.sync {
             guard !isStarted else { return }
 
-            let cacheRoot = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-            let downloadPath = cacheRoot.appendingPathComponent("TorrentCache", isDirectory: true).path
-
             do {
-                try FileManager.default.createDirectory(atPath: downloadPath, withIntermediateDirectories: true)
+                try FileManager.default.createDirectory(
+                    atPath: cacheDirectoryPath,
+                    withIntermediateDirectories: true
+                )
             } catch {
                 lastStartError = "Failed to create torrent cache: \(error.localizedDescription)"
                 return
             }
 
-            let startResult = GotorrentStartEngine(downloadPath, configJson) ?? ""
+            let startResult = GotorrentStartEngine(cacheDirectoryPath, configJson) ?? ""
             if startResult.isEmpty {
                 lastStartError = ""
                 isStarted = true
@@ -75,9 +81,9 @@ import GoTorrent
     }
 
     @objc public func removeTorrentSession(sessionId: String) {
-        engineQueue.async {
-            guard self.isStarted else { return }
-            self.sessions.removeValue(forKey: sessionId)
+        engineQueue.sync {
+            guard isStarted else { return }
+            sessions.removeValue(forKey: sessionId)
             GotorrentRemoveTorrent(sessionId)
         }
     }
@@ -98,6 +104,24 @@ import GoTorrent
         engineQueue.sync {
             guard isStarted else { return "{}" }
             return GotorrentGetEngineStatsJson() ?? "{}"
+        }
+    }
+
+    @objc public func getCacheStatsJson() -> String {
+        engineQueue.sync {
+            GotorrentGetCacheStatsJson(cacheDirectoryPath) ?? "{}"
+        }
+    }
+
+    @objc public func reclaimCacheJson(maxBytes: Int64) -> String {
+        engineQueue.sync {
+            GotorrentReclaimCache(cacheDirectoryPath, maxBytes) ?? "{}"
+        }
+    }
+
+    @objc public func clearCacheJson() -> String {
+        engineQueue.sync {
+            GotorrentClearCache(cacheDirectoryPath) ?? "{}"
         }
     }
 

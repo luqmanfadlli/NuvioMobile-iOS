@@ -206,9 +206,7 @@ jobs:
         uses: actions/cache@v5
         with:
           path: iosApp/Frameworks/GoTorrent.xcframework
-          key: ${{ runner.os }}-gotorrent-v2-${{ hashFiles('go-torrent/go.mod', 'go-torrent/go.sum', 'go-torrent/*.go', 'scripts/build-gotorrent-xcframework.sh') }}
-          restore-keys: |
-            ${{ runner.os }}-gotorrent-v2-
+          key: ${{ runner.os }}-gotorrent-v3-${{ hashFiles('go-torrent/go.mod', 'go-torrent/go.sum', 'go-torrent/*.go', 'scripts/build-gotorrent-xcframework.sh') }}
 
       - name: Install gomobile and register gobind tool dependency
         env:
@@ -231,6 +229,7 @@ jobs:
       - name: Build GoTorrent XCFramework
         env:
           GOTOOLCHAIN: auto
+          GOTORRENT_CACHE_HIT: ${{ steps.cache-gotorrent.outputs.cache-hit }}
         run: |
           set -euo pipefail
           chmod +x ./scripts/build-gotorrent-xcframework.sh
@@ -239,9 +238,10 @@ jobs:
           FRAMEWORK_ROOT="iosApp/Frameworks/GoTorrent.xcframework"
           DEVICE_FRAMEWORK="$FRAMEWORK_ROOT/ios-arm64/GoTorrent.framework/GoTorrent"
 
-          if [ -f "$DEVICE_FRAMEWORK" ]; then
-            echo "Using cached GoTorrent device framework: $DEVICE_FRAMEWORK"
+          if [ "$GOTORRENT_CACHE_HIT" = "true" ] && [ -f "$DEVICE_FRAMEWORK" ]; then
+            echo "Using exact cached GoTorrent device framework: $DEVICE_FRAMEWORK"
           else
+            echo "GoTorrent sources changed or no exact cache hit; rebuilding XCFramework"
             rm -rf "$FRAMEWORK_ROOT"
             ./scripts/build-gotorrent-xcframework.sh
           fi

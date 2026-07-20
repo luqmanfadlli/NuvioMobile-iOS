@@ -15,6 +15,9 @@ interface IosP2pNativeBridge {
     fun removeTorrentSession(sessionId: String)
     fun getSessionStatusJson(sessionId: String): String
     fun getEngineStatsJson(): String
+    fun getCacheStatsJson(): String
+    fun reclaimCacheJson(maxBytes: Long): String
+    fun clearCacheJson(): String
     fun destroyEngine()
 }
 

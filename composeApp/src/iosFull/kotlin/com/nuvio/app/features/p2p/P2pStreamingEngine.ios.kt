@@ -19,7 +19,7 @@ import platform.Foundation.NSLock
 
 private const val IOS_P2P_METADATA_TIMEOUT_MS = 45_000L
 private const val IOS_P2P_STATUS_POLL_MS = 1_000L
-private const val IOS_P2P_DEFAULT_CACHE_BYTES = 512L * 1024L * 1024L
+private const val IOS_P2P_CACHE_RECLAIM_POLL_TICKS = 5
 private const val IOS_P2P_DEFAULT_MAX_PEERS = 160
 
 actual object P2pStreamingEngine {
@@ -36,6 +36,7 @@ actual object P2pStreamingEngine {
     private var bridge: IosP2pNativeBridge? = null
     private var statsJob: Job? = null
     private var activeSessionId: String? = null
+    private var activeEngineConfigJson: String? = null
     private var streamGeneration = 0L
 
     actual suspend fun startStream(request: P2pStreamRequest): String = withContext(Dispatchers.Default) {
@@ -45,9 +46,7 @@ actual object P2pStreamingEngine {
 
         try {
             val nativeBridge = ensureBridge()
-            if (!nativeBridge.isEngineRunning()) {
-                nativeBridge.startEngine(buildEngineConfigJson())
-            }
+            ensureConfiguredEngine(nativeBridge)
             ensureCurrentGeneration(generation)
 
             val magnetUri = buildMagnetUri(request.infoHash, request.trackers)
@@ -69,6 +68,7 @@ actual object P2pStreamingEngine {
                 nativeBridge.removeTorrentSession(sessionId)
                 throw CancellationException("P2P stream start was cancelled")
             }
+            refreshCacheState(nativeBridge, reclaim = true)
 
             val readyStatus = waitForPlayableStatus(nativeBridge, sessionId, generation)
             val streamUrl = readyStatus.streamUrl.ifBlank {
@@ -112,16 +112,57 @@ actual object P2pStreamingEngine {
         }
     }
 
-    actual suspend fun clearCache(): P2pCacheClearResult {
+    actual suspend fun clearCache(): P2pCacheClearResult = withContext(Dispatchers.Default) {
         check(
             _state.value !is P2pStreamingState.Connecting &&
                 _state.value !is P2pStreamingState.Streaming,
         ) {
             "Torrent cache cannot be cleared during active playback"
         }
-        throw P2pStreamingException(
-            "Clearing the GoTorrent cache is not supported by the current iOS native bridge",
-        )
+
+        _cacheState.value = _cacheState.value.copy(isClearing = true)
+        try {
+            val nativeBridge = ensureBridge()
+            val usageBeforeClear = parseCacheStats(nativeBridge.getCacheStatsJson())
+            if (nativeBridge.isEngineRunning()) {
+                nativeBridge.stopEngine()
+                activeEngineConfigJson = null
+            }
+            val cacheStats = parseCacheStats(nativeBridge.clearCacheJson())
+                ?: throw P2pStreamingException("Native iOS torrent engine returned empty cache statistics")
+            if (!cacheStats.errorMessage.isNullOrBlank()) {
+                throw P2pStreamingException(cacheStats.errorMessage.orEmpty())
+            }
+            publishCacheState(cacheStats, isClearing = true)
+            val reclaimedBytes = usageBeforeClear
+                ?.usedBytes
+                ?.minus(cacheStats.usedBytes)
+                ?.coerceAtLeast(cacheStats.reclaimedBytes)
+                ?: cacheStats.reclaimedBytes
+            P2pCacheClearResult(
+                reclaimedBytes = reclaimedBytes,
+                remainingBytes = cacheStats.usedBytes,
+                protectedBytes = cacheStats.protectedBytes,
+            )
+        } finally {
+            _cacheState.value = _cacheState.value.copy(isClearing = false)
+        }
+    }
+
+    private fun ensureConfiguredEngine(nativeBridge: IosP2pNativeBridge) {
+        val configJson = buildEngineConfigJson()
+        if (nativeBridge.isEngineRunning() && activeEngineConfigJson != configJson) {
+            nativeBridge.stopEngine()
+            activeEngineConfigJson = null
+        }
+        if (!nativeBridge.isEngineRunning()) {
+            nativeBridge.startEngine(configJson)
+        }
+        if (!nativeBridge.isEngineRunning()) {
+            throw P2pStreamingException("Native iOS torrent engine failed to start")
+        }
+        activeEngineConfigJson = configJson
+        refreshCacheState(nativeBridge, reclaim = true)
     }
 
     private suspend fun waitForPlayableStatus(
@@ -169,12 +210,15 @@ actual object P2pStreamingEngine {
         }
 
         detached.second?.cancel()
+        val nativeBridge = bridge
         detached.first?.let { sessionId ->
-            bridge?.removeTorrentSession(sessionId)
+            nativeBridge?.removeTorrentSession(sessionId)
         }
         if (stopEngine) {
-            bridge?.stopEngine()
+            nativeBridge?.stopEngine()
+            activeEngineConfigJson = null
         }
+        nativeBridge?.let { refreshCacheState(it, reclaim = !stopEngine) }
         _state.value = P2pStreamingState.Idle
     }
 
@@ -227,6 +271,7 @@ actual object P2pStreamingEngine {
     ) {
         statsJob?.cancel()
         statsJob = scope.launch {
+            var cachePollTick = 0
             while (isActive) {
                 if (!isCurrentGeneration(generation)) return@launch
                 try {
@@ -248,14 +293,39 @@ actual object P2pStreamingEngine {
                             verifiedBytes = status.downloadedBytes,
                         )
                     }
+                    if (cachePollTick == 0) {
+                        refreshCacheState(nativeBridge, reclaim = true)
+                    }
+                    cachePollTick = (cachePollTick + 1) % IOS_P2P_CACHE_RECLAIM_POLL_TICKS
                 } catch (cancellation: CancellationException) {
                     throw cancellation
                 } catch (_: Exception) {
-                    // Keep playback alive if a transient stats poll fails.
+                    // Keep playback alive if a transient stats or cache poll fails.
                 }
                 delay(IOS_P2P_STATUS_POLL_MS)
             }
         }
+    }
+
+    private fun refreshCacheState(nativeBridge: IosP2pNativeBridge, reclaim: Boolean) {
+        val response = if (reclaim) {
+            P2pSettingsRepository.ensureLoaded()
+            nativeBridge.reclaimCacheJson(P2pSettingsRepository.uiState.value.cacheSize.bytes)
+        } else {
+            nativeBridge.getCacheStatsJson()
+        }
+        val cacheStats = parseCacheStats(response) ?: return
+        if (!cacheStats.errorMessage.isNullOrBlank()) return
+        publishCacheState(cacheStats, isClearing = _cacheState.value.isClearing)
+    }
+
+    private fun publishCacheState(cacheStats: NativeTorrentCacheStats, isClearing: Boolean) {
+        _cacheState.value = P2pCacheUiState(
+            usedBytes = cacheStats.usedBytes.coerceAtLeast(0L),
+            protectedBytes = cacheStats.protectedBytes.coerceAtLeast(0L),
+            isClearing = isClearing,
+            hasMeasurement = true,
+        )
     }
 
     private fun buildEngineConfigJson(): String {
@@ -263,7 +333,7 @@ actual object P2pStreamingEngine {
         val settings = P2pSettingsRepository.uiState.value
         return buildString {
             append('{')
-            append("\"maxCacheSizeBytes\":$IOS_P2P_DEFAULT_CACHE_BYTES,")
+            append("\"maxCacheSizeBytes\":${settings.cacheSize.bytes},")
             append("\"maxDownloadRate\":0,")
             append("\"maxUploadRate\":0,")
             append("\"enableUpload\":${settings.enableUpload},")
@@ -291,6 +361,15 @@ actual object P2pStreamingEngine {
             json.decodeFromString<NativeTorrentSessionStatus>(jsonString)
         } catch (_: Exception) {
             NativeTorrentSessionStatus(errorMessage = "Failed to parse native torrent status")
+        }
+    }
+
+    private fun parseCacheStats(jsonString: String): NativeTorrentCacheStats? {
+        if (jsonString.isBlank() || jsonString == "{}") return null
+        return try {
+            json.decodeFromString<NativeTorrentCacheStats>(jsonString)
+        } catch (_: Exception) {
+            NativeTorrentCacheStats(errorMessage = "Failed to parse native torrent cache statistics")
         }
     }
 
@@ -329,5 +408,15 @@ private data class NativeTorrentSessionStatus(
     val progress: Double = 0.0,
     val isMetadataResolved: Boolean = false,
     val isStreaming: Boolean = false,
+    val errorMessage: String? = null,
+)
+
+@Serializable
+private data class NativeTorrentCacheStats(
+    val usedBytes: Long = 0L,
+    val protectedBytes: Long = 0L,
+    val reclaimedBytes: Long = 0L,
+    val limitBytes: Long = 0L,
+    val activeSessions: Int = 0,
     val errorMessage: String? = null,
 )

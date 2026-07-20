@@ -12,6 +12,7 @@ import (
 
 	"github.com/anacrolix/torrent"
 	"github.com/anacrolix/torrent/metainfo"
+	"github.com/anacrolix/torrent/storage"
 	"golang.org/x/time/rate"
 )
 
@@ -86,11 +87,18 @@ func StartEngine(dataDir string, configJson string) (res string) {
 		_ = json.Unmarshal([]byte(configJson), &parsedCfg)
 	}
 
+	cacheStats := configureCacheLocked(dataDir, parsedCfg.MaxCacheSizeBytes)
+	if cacheStats.ErrorMessage != "" {
+		lastInitError = "Cache initialization failed: " + cacheStats.ErrorMessage
+		return lastInitError
+	}
+
 	cfg := torrent.NewDefaultClientConfig()
 	cfg.DataDir = dataDir
+	// Partition payloads by info-hash so inactive torrents can be reclaimed
+	// without touching the stream currently served to MPV.
+	cfg.DefaultStorage = storage.NewFileByInfoHash(dataDir)
 
-	// Use default storage (memory-mapped files) which provides an OS-level RAM cache.
-	// cfg.DefaultStorage is managed automatically by torrent.NewDefaultClientConfig().
 	// Apply dynamic settings
 	cfg.NoDefaultPortForwarding = !parsedCfg.EnableUpnp
 	cfg.DisableUTP = parsedCfg.ForceTcp
@@ -155,6 +163,8 @@ func StartEngine(dataDir string, configJson string) (res string) {
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
+		client.Close()
+		client = nil
 		lastInitError = "Listen failed: " + err.Error()
 		return lastInitError
 	}
@@ -165,6 +175,7 @@ func StartEngine(dataDir string, configJson string) (res string) {
 
 	server = &http.Server{Handler: mux}
 	go server.Serve(listener)
+	lastInitError = ""
 
 	return ""
 }
@@ -180,6 +191,7 @@ func StopEngine() {
 		client.Close()
 		client = nil
 	}
+	_ = reclaimCacheLocked(cacheRootDir, cacheLimitBytes)
 }
 
 func AddMagnet(uri string, fileIdx int) (res string) {
@@ -308,6 +320,10 @@ func RemoveTorrent(hash string) {
 			}
 		}
 	}
+	speedTrackerMu.Lock()
+	delete(speedTracker, hash)
+	speedTrackerMu.Unlock()
+	_ = reclaimCacheLocked(cacheRootDir, cacheLimitBytes)
 }
 
 func GetEngineStatsJson() string {

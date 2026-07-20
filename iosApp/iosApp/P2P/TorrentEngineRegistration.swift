@@ -34,6 +34,18 @@ final class IosP2pNativeBridgeImpl: NSObject, IosP2pNativeBridge {
         engine.getEngineStatsJson()
     }
 
+    func getCacheStatsJson() -> String {
+        engine.getCacheStatsJson()
+    }
+
+    func reclaimCacheJson(maxBytes: Int64) -> String {
+        engine.reclaimCacheJson(maxBytes: maxBytes)
+    }
+
+    func clearCacheJson() -> String {
+        engine.clearCacheJson()
+    }
+
     func destroyEngine() {
         engine.destroyEngine()
     }
