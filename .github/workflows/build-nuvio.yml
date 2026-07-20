@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - debugging
+      - 0.3.1-enhanced
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
