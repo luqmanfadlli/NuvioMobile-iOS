@@ -499,14 +499,18 @@ private fun BoxScope.RenderPlaybackOverlays(
         skipIntervalDismissed = skipIntervalDismissed,
         controlsVisible = controlsVisible,
         onSkipInterval = { interval ->
-            val targetMs = (interval.endTime * 1000).toLong()
+            // Upstream's clamp: an interval that ends at (or past) the runtime would otherwise
+            // seek to EOF and end playback instead of skipping the intro.
+            val rawMs = (interval.endTime * 1000.0).toLong()
+            val durationMs = playbackSnapshot.durationMs
+            val seekMs = if (durationMs > 0L) rawMs.coerceAtMost(durationMs - 1) else rawMs
             InAppLogger.info(
                 "Player/SkipIntro",
                 "skip type=${interval.type} provider=${interval.provider} " +
-                    "fromMs=${playbackSnapshot.positionMs} targetMs=$targetMs " +
+                    "fromMs=${playbackSnapshot.positionMs} targetMs=$seekMs rawMs=$rawMs " +
                     "startSec=${interval.startTime} endSec=${interval.endTime}",
             )
-            playerController?.seekTo(targetMs)
+            playerController?.seekTo(seekMs)
             scheduleProgressSyncAfterSeek()
             skipIntervalDismissed = true
         },
