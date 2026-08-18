@@ -26,21 +26,68 @@ import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.sqrt
 import org.jetbrains.skia.Bitmap
+import org.jetbrains.skia.Canvas
 import org.jetbrains.skia.Codec
 import org.jetbrains.skia.Data
 import org.jetbrains.skia.Image
+import org.jetbrains.skia.ImageInfo
+import org.jetbrains.skia.Rect
+import org.jetbrains.skia.SamplingMode
+
+/**
+ * Skia-backed animated image decoding for iOS (GIF and animated WebP).
+ *
+ * Design constraint: **total memory held by animations is bounded by a
+ * constant**, not by how many animated images the screen happens to show.
+ *
+ * Two earlier designs failed this. Holding every frame at source resolution
+ * (ImageIO) blew past the jetsam limit with a dozen posters. Decoding frame by
+ * frame fixed the steady-state footprint but allocated a full-size
+ * [Image.makeFromBitmap] copy on *every* tick — Skia copies unless the source
+ * bitmap is immutable — and 22 posters animating at once produced garbage
+ * faster than the Kotlin/Native collector could reclaim it: 2.05 GB in 18
+ * seconds from a cold start.
+ *
+ * So: every frame is decoded once, downscaled to the size it will actually be
+ * drawn at, and kept. The codec is closed immediately afterwards. Playback then
+ * allocates nothing at all — it walks a prebuilt list. An animation that would
+ * not fit the budget is simply not animated, and the caller falls back to a
+ * static image.
+ */
 
 private const val MinFrameDurationMillis = 20
 private const val MaxCachedSourceBytes = 24L * 1024 * 1024
 private const val MaxConcurrentLoads = 6
-
 private const val IdleRetentionMillis = 2_000L
 
+/** Ceiling for all decoded animation frames alive at once, across the app. */
+private const val MaxAnimationBudgetBytes = 120L * 1024 * 1024
+
+/** Ceiling for a single animation; larger sources are downscaled to fit. */
+private const val MaxPerAnimationBytes = 20L * 1024 * 1024
+
+/** Target sizes are rounded up to this, so equally-sized call sites share. */
+private const val SizeBucketPx = 64
+
+internal const val MaxAnimationTargetEdgePx = 1024
+internal const val DefaultAnimationTargetEdgePx = 256
+
+/** Below this, shrinking to fit the budget degrades the image too far. */
+private const val MinAnimationEdgePx = 96
+
+/** Flip to false for release builds. */
 internal const val AnimatedImageProbeLogging = true
 
 private val animatedSourceHttpClient by lazy { HttpClient(Darwin) }
 private val loadSemaphore = Semaphore(MaxConcurrentLoads)
+
+// ---------------------------------------------------------------------------
+// Compressed source cache (bytes only)
+// ---------------------------------------------------------------------------
 
 private val sourceCacheLock = Mutex()
 private val sourceCache = LinkedHashMap<String, ByteArray>()
@@ -63,78 +110,199 @@ private suspend fun storeSourceBytes(url: String, bytes: ByteArray) = sourceCach
     }
 }
 
-internal class SkiaAnimatedImage private constructor(
-    private val codec: Codec,
-    @Suppress("unused") private val source: Data,
-) {
-    private val frameInfos = codec.framesInfo
-    private val bitmap = Bitmap().apply { allocPixels(codec.imageInfo) }
-    private var lastDecodedFrame = -1
-    private var closed = false
+private suspend fun fetchSourceBytes(url: String): ByteArray? = loadSemaphore.withPermit {
+    cachedSourceBytes(url) ?: withContext(Dispatchers.Default) {
+        runCatching {
+            animatedSourceHttpClient.get(url).body<ByteArray>().takeIf { it.isNotEmpty() }
+        }.getOrNull()
+    }?.also { storeSourceBytes(url, it) }
+}
 
-    val frameCount: Int = codec.frameCount
+// ---------------------------------------------------------------------------
+// Decoding
+// ---------------------------------------------------------------------------
 
-    fun frameDurationMillis(index: Int): Int =
-        frameInfos.getOrNull(index)?.duration?.coerceAtLeast(MinFrameDurationMillis)
-            ?: MinFrameDurationMillis
+private class AnimationFrames(
+    val frames: List<ImageBitmap>,
+    val durationsMs: IntArray,
+    val bytes: Long,
+)
 
-    fun decodeFrame(index: Int): ImageBitmap? {
-        if (closed) return null
-        return runCatching {
-            val requiredFrame = frameInfos.getOrNull(index)?.requiredFrame ?: -1
+/**
+ * Decodes every frame at [targetWidth] x [targetHeight] (never upscaling) and
+ * returns them, or null if the source is not animated, fails to decode, or
+ * would not fit within [budgetBytes] / [MaxPerAnimationBytes].
+ *
+ * Runs off the main thread. The codec and all intermediates are released before
+ * returning; only the downscaled frames survive.
+ */
+private fun decodeAnimation(
+    source: ByteArray,
+    targetWidth: Int,
+    targetHeight: Int,
+    budgetBytes: Long,
+): AnimationFrames? {
+    val data = runCatching { Data.makeFromBytes(source) }.getOrNull() ?: return null
+    val codec = runCatching { Codec.makeFromData(data) }.getOrNull()
+    if (codec == null) {
+        runCatching { data.close() }
+        return null
+    }
+
+    var sourceBitmap: Bitmap? = null
+    try {
+        val frameCount = codec.frameCount
+        if (frameCount <= 1) return null
+
+        val info = codec.imageInfo
+        val sourceWidth = info.width
+        val sourceHeight = info.height
+        if (sourceWidth <= 0 || sourceHeight <= 0) return null
+
+        // Two limits on scale, whichever is smaller:
+        //   1. the size it will be drawn at (never upscale)
+        //   2. whatever keeps frameCount frames inside MaxPerAnimationBytes
+        //
+        // (2) matters: a poster card is ~512x768 px on a 3x screen, which at 40
+        // frames would be 63 MB for a single poster. Shrinking to fit means an
+        // animation is softer rather than absent — solving
+        //   (srcW*s) * (srcH*s) * 4 * frames <= cap
+        // for s.
+        val drawScale = min(
+            min(targetWidth.toFloat() / sourceWidth, targetHeight.toFloat() / sourceHeight),
+            1f,
+        )
+        val budgetScale = sqrt(
+            MaxPerAnimationBytes.toDouble() /
+                (sourceWidth.toDouble() * sourceHeight.toDouble() * 4.0 * frameCount.toDouble())
+        ).toFloat()
+        val scale = min(drawScale, budgetScale)
+
+        // Truncate rather than round: rounding up could push the result back
+        // over the per-animation cap we just solved for.
+        val outWidth = max(1, (sourceWidth * scale).toInt())
+        val outHeight = max(1, (sourceHeight * scale).toInt())
+
+        // Refuse only when the *budget* forced the image below the floor. A
+        // genuinely small draw size is not a problem: a 16 dp badge is supposed
+        // to decode at ~48 px, and treating that as "too degraded" would stop
+        // every badge in the app from animating.
+        if (budgetScale < drawScale && max(outWidth, outHeight) < MinAnimationEdgePx) {
+            if (AnimatedImageProbeLogging) {
+                println(
+                    "[SkiaAnimatedImage] skipped: $frameCount frames only fit at " +
+                        "${outWidth}x$outHeight, below the ${MinAnimationEdgePx}px floor"
+                )
+            }
+            return null
+        }
+
+        val totalBytes = outWidth.toLong() * outHeight.toLong() * 4L * frameCount.toLong()
+        if (totalBytes > budgetBytes) {
+            if (AnimatedImageProbeLogging) {
+                println(
+                    "[SkiaAnimatedImage] skipped: ${totalBytes / 1024}KB needed, " +
+                        "${budgetBytes / 1024}KB left in budget"
+                )
+            }
+            return null
+        }
+
+        val infos = codec.framesInfo
+        val decodeTarget = Bitmap().apply { allocPixels(info) }
+        sourceBitmap = decodeTarget
+
+        val frames = ArrayList<ImageBitmap>(frameCount)
+        val durations = IntArray(frameCount)
+        var lastDecodedFrame = -1
+
+        for (index in 0 until frameCount) {
+            val requiredFrame = infos.getOrNull(index)?.requiredFrame ?: -1
             if (lastDecodedFrame >= 0 && lastDecodedFrame == requiredFrame) {
-                codec.readPixels(bitmap, index, lastDecodedFrame)
+                codec.readPixels(decodeTarget, index, lastDecodedFrame)
             } else {
-                codec.readPixels(bitmap, index)
+                codec.readPixels(decodeTarget, index)
             }
             lastDecodedFrame = index
-            Image.makeFromBitmap(bitmap).toComposeImageBitmap()
-        }.getOrNull()
-    }
+            durations[index] = infos.getOrNull(index)?.duration
+                ?.coerceAtLeast(MinFrameDurationMillis)
+                ?: MinFrameDurationMillis
 
-    fun close() {
-        if (closed) return
-        closed = true
-        runCatching { bitmap.close() }
+            // Transient: one full-size image, released before the next frame.
+            val fullSize = Image.makeFromBitmap(decodeTarget)
+            try {
+                val scaled = Bitmap().apply {
+                    allocPixels(ImageInfo.makeN32Premul(outWidth, outHeight))
+                }
+                val canvas = Canvas(scaled)
+                try {
+                    canvas.drawImageRect(
+                        image = fullSize,
+                        src = Rect.makeWH(sourceWidth.toFloat(), sourceHeight.toFloat()),
+                        dst = Rect.makeWH(outWidth.toFloat(), outHeight.toFloat()),
+                        samplingMode = SamplingMode.MITCHELL,
+                        paint = null,
+                        strict = true,
+                    )
+                } finally {
+                    runCatching { canvas.close() }
+                }
+                frames += Image.makeFromBitmap(scaled).toComposeImageBitmap()
+                runCatching { scaled.close() }
+            } finally {
+                runCatching { fullSize.close() }
+            }
+        }
+
+        if (AnimatedImageProbeLogging) {
+            println(
+                "[SkiaAnimatedImage] decoded ${sourceWidth}x$sourceHeight -> " +
+                    "${outWidth}x$outHeight, frames=$frameCount, ${totalBytes / 1024}KB"
+            )
+        }
+        return AnimationFrames(frames, durations, totalBytes)
+    } catch (throwable: Throwable) {
+        return null
+    } finally {
+        runCatching { sourceBitmap?.close() }
         runCatching { codec.close() }
-    }
-
-    companion object {
-        fun fromBytes(bytes: ByteArray): SkiaAnimatedImage? = runCatching {
-            val data = Data.makeFromBytes(bytes)
-            val codec = Codec.makeFromData(data)
-            SkiaAnimatedImage(codec, data)
-        }.getOrNull()
+        runCatching { data.close() }
     }
 }
 
-private suspend fun loadSkiaAnimatedImage(url: String): SkiaAnimatedImage? =
-    loadSemaphore.withPermit {
-        val bytes = cachedSourceBytes(url) ?: withContext(Dispatchers.Default) {
-            runCatching {
-                animatedSourceHttpClient.get(url).body<ByteArray>().takeIf { it.isNotEmpty() }
-            }.getOrNull()
-        }?.also { storeSourceBytes(url, it) } ?: return@withPermit null
-
-        withContext(Dispatchers.Default) { SkiaAnimatedImage.fromBytes(bytes) }
-    }
+// ---------------------------------------------------------------------------
+// Shared, reference-counted, budgeted animations
+//
+// Everything below runs on Dispatchers.Main. Compose effects run there too, so
+// the registry and the budget counter are single-threaded by construction and
+// need no lock; interleaving is only possible at suspension points, handled by
+// the `pending` map and the `released` flag.
+// ---------------------------------------------------------------------------
 
 private class SharedAnimation(
-    val url: String,
-    val image: SkiaAnimatedImage,
+    val key: String,
+    val animation: AnimationFrames,
 ) {
     var refCount: Int = 0
     var job: Job? = null
     var idleEviction: Job? = null
-    val frame: MutableState<ImageBitmap?> = mutableStateOf(null)
+    val frame: MutableState<ImageBitmap?> = mutableStateOf(animation.frames.firstOrNull())
 }
 
 private val registryScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 private val registry = mutableMapOf<String, SharedAnimation>()
 private val pending = mutableMapOf<String, Deferred<SharedAnimation?>>()
+private var budgetUsedBytes = 0L
 
-private suspend fun acquireShared(url: String): SharedAnimation? {
-    registry[url]?.let { existing ->
+private fun bucket(value: Int): Int {
+    val clamped = value.coerceIn(1, MaxAnimationTargetEdgePx)
+    return ((clamped + SizeBucketPx - 1) / SizeBucketPx) * SizeBucketPx
+}
+
+private suspend fun acquireShared(url: String, targetWidth: Int, targetHeight: Int): SharedAnimation? {
+    val key = "$url|${targetWidth}x$targetHeight"
+
+    registry[key]?.let { existing ->
         existing.refCount++
         existing.idleEviction?.cancel()
         existing.idleEviction = null
@@ -142,23 +310,26 @@ private suspend fun acquireShared(url: String): SharedAnimation? {
         return existing
     }
 
-    val inFlight = pending[url] ?: registryScope.async {
-        val image = loadSkiaAnimatedImage(url) ?: return@async null
-        if (AnimatedImageProbeLogging) {
-            println("[SkiaAnimatedImage] $url -> frameCount=${image.frameCount}")
-        }
-        if (image.frameCount <= 1) {
-            // Nothing to animate; let Coil render it statically.
-            image.close()
-            return@async null
-        }
-        SharedAnimation(url, image).also { registry[url] = it }
-    }.also { pending[url] = it }
+    val inFlight = pending[key] ?: registryScope.async {
+        val bytes = fetchSourceBytes(url) ?: return@async null
+        val remaining = MaxAnimationBudgetBytes - budgetUsedBytes
+        if (remaining <= 0) return@async null
+
+        val animation = withContext(Dispatchers.Default) {
+            decodeAnimation(bytes, targetWidth, targetHeight, remaining)
+        } ?: return@async null
+
+        // Re-check: other decodes may have committed while this one ran.
+        if (budgetUsedBytes + animation.bytes > MaxAnimationBudgetBytes) return@async null
+
+        budgetUsedBytes += animation.bytes
+        SharedAnimation(key, animation).also { registry[key] = it }
+    }.also { pending[key] = it }
 
     val shared = try {
         inFlight.await()
     } finally {
-        if (pending[url] === inFlight) pending.remove(url)
+        if (pending[key] === inFlight) pending.remove(key)
     } ?: return null
 
     shared.refCount++
@@ -170,16 +341,16 @@ private suspend fun acquireShared(url: String): SharedAnimation? {
 
 private fun startIfNeeded(shared: SharedAnimation) {
     if (shared.job != null) return
-    shared.job = registryScope.launch {
-        val image = shared.image
-        var index = 0
-        withContext(Dispatchers.Default) { image.decodeFrame(0) }?.let { shared.frame.value = it }
+    val animation = shared.animation
+    if (animation.frames.size <= 1) return
 
-        while (image.frameCount > 1) {
-            delay(image.frameDurationMillis(index).toLong())
-            index = (index + 1) % image.frameCount
-            withContext(Dispatchers.Default) { image.decodeFrame(index) }
-                ?.let { shared.frame.value = it }
+    // Playback allocates nothing: it walks a list decoded once, up front.
+    shared.job = registryScope.launch {
+        var index = 0
+        while (true) {
+            delay(animation.durationsMs[index].toLong())
+            index = (index + 1) % animation.frames.size
+            shared.frame.value = animation.frames[index]
         }
     }
 }
@@ -188,35 +359,57 @@ private fun releaseShared(shared: SharedAnimation) {
     shared.refCount--
     if (shared.refCount > 0) return
 
+    // Keep briefly: scrolling makes items come and go, and rebuilding an
+    // animation costs a full decode.
     shared.idleEviction?.cancel()
     shared.idleEviction = registryScope.launch {
         delay(IdleRetentionMillis)
-        evictIfIdle(shared.url)
+        evictIfIdle(shared.key)
     }
 }
 
-private fun evictIfIdle(url: String) {
-    val shared = registry[url] ?: return
+private fun evictIfIdle(key: String) {
+    val shared = registry[key] ?: return
     if (shared.refCount > 0) return
     shared.job?.cancel()
     shared.job = null
     shared.idleEviction = null
-    registry.remove(url)
+    registry.remove(key)
     shared.frame.value = null
-    shared.image.close()
+    budgetUsedBytes -= shared.animation.bytes
+    if (budgetUsedBytes < 0) budgetUsedBytes = 0
 }
 
-@Composable
-internal fun rememberAnimatedFrame(url: String): ImageBitmap? {
-    var shared by remember(url) { mutableStateOf<SharedAnimation?>(null) }
+// ---------------------------------------------------------------------------
+// Compose entry point
+// ---------------------------------------------------------------------------
 
-    DisposableEffect(url) {
+/**
+ * Subscribes to the shared animation for [url] at the given target size and
+ * returns the frame to draw right now.
+ *
+ * Returns null while loading, if the source is not animated, or if the
+ * animation does not fit the memory budget — callers render a static image in
+ * all three cases.
+ */
+@Composable
+internal fun rememberAnimatedFrame(
+    url: String,
+    targetWidthPx: Int,
+    targetHeightPx: Int,
+): ImageBitmap? {
+    val width = bucket(targetWidthPx)
+    val height = bucket(targetHeightPx)
+    var shared by remember(url, width, height) { mutableStateOf<SharedAnimation?>(null) }
+
+    DisposableEffect(url, width, height) {
         var released = false
         var acquired: SharedAnimation? = null
 
         val subscription = registryScope.launch {
-            val result = acquireShared(url) ?: return@launch
+            val result = acquireShared(url, width, height) ?: return@launch
             if (released) {
+                // Disposed mid-load; hand the reference straight back.
                 releaseShared(result)
                 return@launch
             }
@@ -227,6 +420,9 @@ internal fun rememberAnimatedFrame(url: String): ImageBitmap? {
         onDispose {
             released = true
             subscription.cancel()
+            // `acquired` is a captured local, not the state holder: this effect
+            // is keyed on url/size, so by the time onDispose runs the state has
+            // already been replaced and reading it would leak the old entry.
             acquired?.let { releaseShared(it) }
         }
     }
