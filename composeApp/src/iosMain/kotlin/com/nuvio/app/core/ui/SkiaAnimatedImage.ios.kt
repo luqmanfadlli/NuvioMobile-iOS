@@ -319,11 +319,29 @@ private suspend fun acquireShared(url: String, targetWidth: Int, targetHeight: I
             decodeAnimation(bytes, targetWidth, targetHeight, remaining)
         } ?: return@async null
 
+        // Another decode may have won the race for this key while this one was
+        // running (possible because a cancelled awaiter drops the pending entry
+        // while this async keeps going). Keep the winner; overwriting it would
+        // strand its bytes in the budget with nothing left to evict them.
+        registry[key]?.let { return@async it }
+
         // Re-check: other decodes may have committed while this one ran.
         if (budgetUsedBytes + animation.bytes > MaxAnimationBudgetBytes) return@async null
 
         budgetUsedBytes += animation.bytes
-        SharedAnimation(key, animation).also { registry[key] = it }
+        val shared = SharedAnimation(key, animation)
+        registry[key] = shared
+
+        // By the time we get here the subscriber that started this may already
+        // be gone — it can be cancelled while suspended in await(), in which
+        // case refCount is never incremented and releaseShared() is never
+        // called for it. Arm the same idle eviction release() would, so an
+        // unclaimed entry cannot hold budget forever. Any acquirer cancels it.
+        shared.idleEviction = registryScope.launch {
+            delay(IdleRetentionMillis)
+            evictIfIdle(key)
+        }
+        shared
     }.also { pending[key] = it }
 
     val shared = try {
