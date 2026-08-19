@@ -1,3 +1,5 @@
+@file:OptIn(kotlinx.cinterop.ExperimentalForeignApi::class)
+
 package com.nuvio.app.core.ui
 
 import androidx.compose.runtime.Composable
@@ -26,7 +28,6 @@ import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
-import kotlinx.cinterop.ExperimentalForeignApi
 import kotlinx.cinterop.addressOf
 import kotlinx.cinterop.usePinned
 import kotlin.math.max
@@ -44,9 +45,9 @@ import platform.Foundation.NSOperationQueue
 import platform.Foundation.NSSearchPathForDirectoriesInDomains
 import platform.Foundation.NSUserDomainMask
 import platform.Foundation.create
-import platform.Foundation.dataWithContentsOfFile
+// timeIntervalSince1970 lives in the NSExtendedDate *category*, not the main
+// NSDate interface, so cinterop exposes it as an extension that must be imported.
 import platform.Foundation.timeIntervalSince1970
-import platform.Foundation.writeToFile
 import platform.UIKit.UIApplicationDidEnterBackgroundNotification
 import platform.UIKit.UIApplicationDidReceiveMemoryWarningNotification
 import platform.UIKit.UIApplicationWillEnterForegroundNotification
@@ -156,7 +157,9 @@ private fun diskCacheFileName(url: String): String {
     for (char in url) {
         val value = char.code.toLong()
         hashA = (hashA xor value) * 0x100000001B3L
-        hashB = (hashB xor (value + 0x9E3779B9L)) * 0xC2B2AE3D27D4EB4FL
+        // 0xC2B2AE3D27D4EB4F written as two's complement: Kotlin has no
+        // unsigned Long literals, and the plain hex form is out of range.
+        hashB = (hashB xor (value + 0x9E3779B9L)) * -0x3D4D51C2D82B14B1L
     }
     fun hex(value: Long): String {
         val digits = "0123456789abcdef"
@@ -188,7 +191,6 @@ private val diskCacheDirectory: String? by lazy {
     }.getOrNull()
 }
 
-@OptIn(ExperimentalForeignApi::class)
 private fun NSData.toByteArray(): ByteArray {
     val size = length.toInt()
     if (size <= 0) return ByteArray(0)
@@ -197,7 +199,6 @@ private fun NSData.toByteArray(): ByteArray {
     return result
 }
 
-@OptIn(ExperimentalForeignApi::class)
 private fun ByteArray.toNSData(): NSData? {
     if (isEmpty()) return null
     return usePinned { pinned ->
@@ -208,7 +209,7 @@ private fun ByteArray.toNSData(): NSData? {
 private fun diskCacheRead(url: String): ByteArray? = runCatching {
     val directory = diskCacheDirectory ?: return@runCatching null
     val path = "$directory/${diskCacheFileName(url)}"
-    val data = NSData.dataWithContentsOfFile(path) ?: return@runCatching null
+    val data = NSFileManager.defaultManager.contentsAtPath(path) ?: return@runCatching null
     // Touch the file so LRU trimming sees it as recently used.
     NSFileManager.defaultManager.setAttributes(
         attributes = mapOf<Any?, Any>(NSFileModificationDate to NSDate()),
@@ -222,7 +223,11 @@ private fun diskCacheWrite(url: String, bytes: ByteArray) {
     runCatching {
         val directory = diskCacheDirectory ?: return
         val data = bytes.toNSData() ?: return
-        data.writeToFile("$directory/${diskCacheFileName(url)}", atomically = true)
+        NSFileManager.defaultManager.createFileAtPath(
+            path = "$directory/${diskCacheFileName(url)}",
+            contents = data,
+            attributes = null,
+        )
         trimDiskCache(directory)
     }
 }
@@ -599,6 +604,7 @@ private fun evictIfIdle(key: String) {
     if (shared.refCount > 0) return
     shared.job?.cancel()
     shared.job = null
+    shared.idleEviction?.cancel()
     shared.idleEviction = null
     registry.remove(key)
     shared.frame.value = null
