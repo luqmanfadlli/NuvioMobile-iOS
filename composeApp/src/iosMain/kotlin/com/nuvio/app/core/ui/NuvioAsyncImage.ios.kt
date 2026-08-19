@@ -17,6 +17,11 @@ import coil3.compose.AsyncImage
  * The measured size is passed down so frames are decoded at the size they are
  * actually drawn at — a 16 dp badge and a 160 dp poster should not cost the
  * same. Call sites of equal size share one decoded animation.
+ *
+ * While an animated source is still downloading, nothing is drawn on top of the
+ * container's own background. Showing a Coil-loaded still there would be nicer
+ * to look at, but it made Coil fetch the same URL this engine was already
+ * fetching — measured at up to 8.6 MB of duplicate traffic per image.
  */
 @Composable
 internal actual fun NuvioAsyncImage(
@@ -46,23 +51,26 @@ internal actual fun NuvioAsyncImage(
             .takeIf { it in 1..MaxAnimationTargetEdgePx }
             ?: DefaultAnimationTargetEdgePx
 
-        val frame = rememberAnimatedFrame(imageUrl, targetWidth, targetHeight)
+        val state = rememberAnimatedFrame(imageUrl, targetWidth, targetHeight)
 
-        if (frame == null) {
-            // Loading, not animated, or over budget — all render statically.
-            AsyncImage(
+        when {
+            // Static, undecodable, or over budget: Coil owns it from here, and
+            // this is the only path that lets Coil touch the network.
+            state.unavailable -> AsyncImage(
                 model = imageUrl,
                 contentDescription = contentDescription,
                 modifier = Modifier.matchParentSize(),
                 contentScale = contentScale,
             )
-        } else {
-            Image(
-                bitmap = frame,
+
+            state.bitmap != null -> Image(
+                bitmap = state.bitmap,
                 contentDescription = contentDescription,
                 modifier = Modifier.matchParentSize(),
                 contentScale = contentScale,
             )
+
+            // Still downloading or decoding: draw nothing.
         }
     }
 }

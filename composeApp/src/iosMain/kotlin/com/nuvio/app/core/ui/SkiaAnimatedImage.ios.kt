@@ -26,9 +26,31 @@ import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
+import kotlinx.cinterop.ExperimentalForeignApi
+import kotlinx.cinterop.addressOf
+import kotlinx.cinterop.usePinned
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sqrt
+import platform.Foundation.NSCachesDirectory
+import platform.Foundation.NSData
+import platform.Foundation.NSDate
+import platform.Foundation.NSFileManager
+import platform.Foundation.NSFileModificationDate
+import platform.Foundation.NSFileSize
+import platform.Foundation.NSNotificationCenter
+import platform.Foundation.NSNumber
+import platform.Foundation.NSOperationQueue
+import platform.Foundation.NSSearchPathForDirectoriesInDomains
+import platform.Foundation.NSUserDomainMask
+import platform.Foundation.create
+import platform.Foundation.dataWithContentsOfFile
+import platform.Foundation.timeIntervalSince1970
+import platform.Foundation.writeToFile
+import platform.UIKit.UIApplicationDidEnterBackgroundNotification
+import platform.UIKit.UIApplicationDidReceiveMemoryWarningNotification
+import platform.UIKit.UIApplicationWillEnterForegroundNotification
+import platform.posix.memcpy
 import org.jetbrains.skia.Bitmap
 import org.jetbrains.skia.Canvas
 import org.jetbrains.skia.Codec
@@ -79,6 +101,10 @@ internal const val DefaultAnimationTargetEdgePx = 256
 /** Below this, shrinking to fit the budget degrades the image too far. */
 private const val MinAnimationEdgePx = 96
 
+/** On-disk cache of compressed sources, so a cold start does not refetch. */
+private const val MaxDiskCacheBytes = 96L * 1024 * 1024
+private const val DiskCacheDirectoryName = "nuvio-animated-sources"
+
 /** Flip to false for release builds. */
 internal const val AnimatedImageProbeLogging = true
 
@@ -110,12 +136,141 @@ private suspend fun storeSourceBytes(url: String, bytes: ByteArray) = sourceCach
     }
 }
 
+// ---------------------------------------------------------------------------
+// Disk tier
+//
+// NSCachesDirectory is the right home for this: the OS may reclaim it under
+// storage pressure, and it is excluded from backups. Only compressed sources
+// live here — never decoded frames.
+//
+// Note this reintroduces Objective-C interop, but NSData and NSFileManager are
+// ARC-managed by Kotlin/Native. The leak that started this whole saga was in
+// *Core Foundation* C types (CFDataCreate / CGImageSourceCreateWithData), which
+// cinterop does not manage. These are a different thing.
+// ---------------------------------------------------------------------------
+
+/** 128-bit FNV-1a. Two independent lanes: collisions are not a practical risk. */
+private fun diskCacheFileName(url: String): String {
+    var hashA = -0x340d631b7bdddcdbL   // 14695981039346656037
+    var hashB = 0x27D4EB2F165667C5L
+    for (char in url) {
+        val value = char.code.toLong()
+        hashA = (hashA xor value) * 0x100000001B3L
+        hashB = (hashB xor (value + 0x9E3779B9L)) * 0xC2B2AE3D27D4EB4FL
+    }
+    fun hex(value: Long): String {
+        val digits = "0123456789abcdef"
+        val builder = StringBuilder(16)
+        for (shift in 60 downTo 0 step 4) {
+            builder.append(digits[((value ushr shift) and 0xF).toInt()])
+        }
+        return builder.toString()
+    }
+    return hex(hashA) + hex(hashB)
+}
+
+private val diskCacheDirectory: String? by lazy {
+    runCatching {
+        val caches = NSSearchPathForDirectoriesInDomains(
+            NSCachesDirectory,
+            NSUserDomainMask,
+            true,
+        ).firstOrNull() as? String ?: return@runCatching null
+
+        val directory = "$caches/$DiskCacheDirectoryName"
+        NSFileManager.defaultManager.createDirectoryAtPath(
+            path = directory,
+            withIntermediateDirectories = true,
+            attributes = null,
+            error = null,
+        )
+        directory
+    }.getOrNull()
+}
+
+@OptIn(ExperimentalForeignApi::class)
+private fun NSData.toByteArray(): ByteArray {
+    val size = length.toInt()
+    if (size <= 0) return ByteArray(0)
+    val result = ByteArray(size)
+    result.usePinned { pinned -> memcpy(pinned.addressOf(0), bytes, length) }
+    return result
+}
+
+@OptIn(ExperimentalForeignApi::class)
+private fun ByteArray.toNSData(): NSData? {
+    if (isEmpty()) return null
+    return usePinned { pinned ->
+        NSData.create(bytes = pinned.addressOf(0), length = size.toULong())
+    }
+}
+
+private fun diskCacheRead(url: String): ByteArray? = runCatching {
+    val directory = diskCacheDirectory ?: return@runCatching null
+    val path = "$directory/${diskCacheFileName(url)}"
+    val data = NSData.dataWithContentsOfFile(path) ?: return@runCatching null
+    // Touch the file so LRU trimming sees it as recently used.
+    NSFileManager.defaultManager.setAttributes(
+        attributes = mapOf<Any?, Any>(NSFileModificationDate to NSDate()),
+        ofItemAtPath = path,
+        error = null,
+    )
+    data.toByteArray().takeIf { it.isNotEmpty() }
+}.getOrNull()
+
+private fun diskCacheWrite(url: String, bytes: ByteArray) {
+    runCatching {
+        val directory = diskCacheDirectory ?: return
+        val data = bytes.toNSData() ?: return
+        data.writeToFile("$directory/${diskCacheFileName(url)}", atomically = true)
+        trimDiskCache(directory)
+    }
+}
+
+private fun trimDiskCache(directory: String) {
+    runCatching {
+        val manager = NSFileManager.defaultManager
+        val names = manager.contentsOfDirectoryAtPath(directory, null) ?: return
+
+        data class Entry(val path: String, val size: Long, val modified: Double)
+
+        val entries = names.mapNotNull { name ->
+            val path = "$directory/$name"
+            val attributes = manager.attributesOfItemAtPath(path, null) ?: return@mapNotNull null
+            val size = (attributes[NSFileSize] as? NSNumber)?.longLongValue ?: return@mapNotNull null
+            val modified = (attributes[NSFileModificationDate] as? NSDate)
+                ?.timeIntervalSince1970 ?: 0.0
+            Entry(path, size, modified)
+        }
+
+        var total = entries.sumOf { it.size }
+        if (total <= MaxDiskCacheBytes) return
+
+        for (entry in entries.sortedBy { it.modified }) {
+            if (total <= MaxDiskCacheBytes) break
+            manager.removeItemAtPath(entry.path, null)
+            total -= entry.size
+        }
+    }
+}
+
 private suspend fun fetchSourceBytes(url: String): ByteArray? = loadSemaphore.withPermit {
-    cachedSourceBytes(url) ?: withContext(Dispatchers.Default) {
+    cachedSourceBytes(url)?.let { return@withPermit it }
+
+    withContext(Dispatchers.Default) { diskCacheRead(url) }?.let { fromDisk ->
+        storeSourceBytes(url, fromDisk)
+        return@withPermit fromDisk
+    }
+
+    val downloaded = withContext(Dispatchers.Default) {
         runCatching {
             animatedSourceHttpClient.get(url).body<ByteArray>().takeIf { it.isNotEmpty() }
         }.getOrNull()
-    }?.also { storeSourceBytes(url, it) }
+    } ?: return@withPermit null
+
+    storeSourceBytes(url, downloaded)
+    withContext(Dispatchers.Default) { diskCacheWrite(url, downloaded) }
+    downloaded
 }
 
 // ---------------------------------------------------------------------------
@@ -293,6 +448,58 @@ private val registryScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 private val registry = mutableMapOf<String, SharedAnimation>()
 private val pending = mutableMapOf<String, Deferred<SharedAnimation?>>()
 private var budgetUsedBytes = 0L
+private var animationsPaused = false
+private var lifecycleObserversInstalled = false
+
+/**
+ * Stops every animation loop while the app is backgrounded, and drops unused
+ * animations when the system reports memory pressure.
+ *
+ * Installed lazily from [acquireShared], which always runs on the main thread.
+ */
+private fun installLifecycleObservers() {
+    if (lifecycleObserversInstalled) return
+    lifecycleObserversInstalled = true
+
+    val center = NSNotificationCenter.defaultCenter
+    val mainQueue = NSOperationQueue.mainQueue
+
+    center.addObserverForName(
+        name = UIApplicationDidEnterBackgroundNotification,
+        `object` = null,
+        queue = mainQueue,
+    ) { _ ->
+        animationsPaused = true
+        registry.values.forEach { shared ->
+            shared.job?.cancel()
+            shared.job = null
+        }
+    }
+
+    center.addObserverForName(
+        name = UIApplicationWillEnterForegroundNotification,
+        `object` = null,
+        queue = mainQueue,
+    ) { _ ->
+        animationsPaused = false
+        registry.values.forEach { shared ->
+            if (shared.refCount > 0) startIfNeeded(shared)
+        }
+    }
+
+    center.addObserverForName(
+        name = UIApplicationDidReceiveMemoryWarningNotification,
+        `object` = null,
+        queue = mainQueue,
+    ) { _ ->
+        // Only unreferenced entries: the referenced ones are on screen, and
+        // dropping those would blank the UI to save memory nobody asked for.
+        registry.keys.toList().forEach { key -> evictIfIdle(key) }
+        if (AnimatedImageProbeLogging) {
+            println("[SkiaAnimatedImage] memory warning: budget now ${budgetUsedBytes / 1024}KB")
+        }
+    }
+}
 
 private fun bucket(value: Int): Int {
     val clamped = value.coerceIn(1, MaxAnimationTargetEdgePx)
@@ -300,6 +507,7 @@ private fun bucket(value: Int): Int {
 }
 
 private suspend fun acquireShared(url: String, targetWidth: Int, targetHeight: Int): SharedAnimation? {
+    installLifecycleObservers()
     val key = "$url|${targetWidth}x$targetHeight"
 
     registry[key]?.let { existing ->
@@ -358,7 +566,7 @@ private suspend fun acquireShared(url: String, targetWidth: Int, targetHeight: I
 }
 
 private fun startIfNeeded(shared: SharedAnimation) {
-    if (shared.job != null) return
+    if (shared.job != null || animationsPaused) return
     val animation = shared.animation
     if (animation.frames.size <= 1) return
 
@@ -403,29 +611,43 @@ private fun evictIfIdle(key: String) {
 // ---------------------------------------------------------------------------
 
 /**
- * Subscribes to the shared animation for [url] at the given target size and
- * returns the frame to draw right now.
+ * What [rememberAnimatedFrame] knows right now.
  *
- * Returns null while loading, if the source is not animated, or if the
- * animation does not fit the memory budget — callers render a static image in
- * all three cases.
+ * The distinction between [Loading] and [unavailable] matters: it is what lets
+ * the caller avoid asking Coil for an animated URL that this engine is already
+ * downloading. Collapsing both into "no frame yet" made every animated image
+ * get fetched twice — once by Coil for the static layer, once here.
+ */
+internal class AnimatedFrame(
+    val bitmap: ImageBitmap?,
+    /** True when this source will never animate: static, undecodable, or over budget. */
+    val unavailable: Boolean,
+)
+
+/**
+ * Subscribes to the shared animation for [url] at the given target size.
  */
 @Composable
 internal fun rememberAnimatedFrame(
     url: String,
     targetWidthPx: Int,
     targetHeightPx: Int,
-): ImageBitmap? {
+): AnimatedFrame {
     val width = bucket(targetWidthPx)
     val height = bucket(targetHeightPx)
     var shared by remember(url, width, height) { mutableStateOf<SharedAnimation?>(null) }
+    var unavailable by remember(url, width, height) { mutableStateOf(false) }
 
     DisposableEffect(url, width, height) {
         var released = false
         var acquired: SharedAnimation? = null
 
         val subscription = registryScope.launch {
-            val result = acquireShared(url, width, height) ?: return@launch
+            val result = acquireShared(url, width, height)
+            if (result == null) {
+                unavailable = true
+                return@launch
+            }
             if (released) {
                 // Disposed mid-load; hand the reference straight back.
                 releaseShared(result)
@@ -445,5 +667,5 @@ internal fun rememberAnimatedFrame(
         }
     }
 
-    return shared?.frame?.value
+    return AnimatedFrame(bitmap = shared?.frame?.value, unavailable = unavailable)
 }
